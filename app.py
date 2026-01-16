@@ -5,15 +5,21 @@ import pandas as pd
 from sim.config import SimConfig
 from sim.portfolio import build_portfolio
 from sim.forecasting import day_ahead_forecast, intraday_nowcast, typical_day_profile
-from sim.markets import make_price_curves
+from sim.markets import make_price_curves, build_layered_hedge_curve_eon_style_seasonal
 from sim.intraday import IntradayState, step_intraday
 from sim.settlement import compute_settlement
 from sim.visuals import portfolio_components, line_with_band, compare_positions, price_chart
 
 st.set_page_config(page_title="Hans Portfolio Walk-Forward Simulator", layout="wide")
 
+
 def regime_mult(name: str, cfg: SimConfig) -> float:
-    return {"Normal": cfg.regime_normal, "Volatile": cfg.regime_volatile, "Crisis": cfg.regime_crisis}.get(name, 1.0)
+    return {
+        "Normal": cfg.regime_normal,
+        "Volatile": cfg.regime_volatile,
+        "Crisis": cfg.regime_crisis,
+    }.get(name, 1.0)
+
 
 @st.cache_data(show_spinner=False)
 def cached_portfolio(cfg_dict: dict, end_date_str: str, weather_regime: str, seed: int):
@@ -31,9 +37,10 @@ def cached_portfolio(cfg_dict: dict, end_date_str: str, weather_regime: str, see
         charger_mix=(cfg.charger_mix_37, cfg.charger_mix_74, cfg.charger_mix_11),
         commuter_share=cfg.commuter_share,
         weather_regime=weather_regime,
-        seed=seed
+        seed=seed,
     )
     return port.as_frame()
+
 
 def init_state():
     if "cfg" not in st.session_state:
@@ -54,6 +61,11 @@ def init_state():
         st.session_state.id_state = None
     if "actual_day_kw" not in st.session_state:
         st.session_state.actual_day_kw = None
+    if "weather_regime" not in st.session_state:
+        st.session_state.weather_regime = "Variable"
+    if "price_regime" not in st.session_state:
+        st.session_state.price_regime = "Normal"
+
 
 init_state()
 cfg: SimConfig = st.session_state.cfg
@@ -75,15 +87,17 @@ with st.sidebar:
     st.caption("Charger mix (fixed in MVP): 3.7/7.4/11 kW")
 
     st.subheader("World")
-    weather_regime = st.selectbox("Weather regime", ["Sunny", "Cloudy", "Variable"], index=2)
-    price_regime = st.selectbox("Price regime", ["Normal", "Volatile", "Crisis"], index=0)
+    st.session_state.weather_regime = st.selectbox("Weather regime", ["Sunny", "Cloudy", "Variable"], index=2)
+    st.session_state.price_regime = st.selectbox("Price regime", ["Normal", "Volatile", "Crisis"], index=0)
 
     seed = st.number_input("Random seed", min_value=1, max_value=999999, value=7, step=1)
 
     end_date = st.date_input("History end date", value=pd.Timestamp("2026-01-16").date())
     if st.button("Generate / Regenerate Portfolio", type="primary"):
         cfg_dict = cfg.__dict__.copy()
-        st.session_state.portfolio_df = cached_portfolio(cfg_dict, str(end_date), weather_regime, int(seed))
+        st.session_state.portfolio_df = cached_portfolio(
+            cfg_dict, str(end_date), st.session_state.weather_regime, int(seed)
+        )
         st.session_state.selected_day = None
         st.session_state.forward_kw = None
         st.session_state.da_kw = None
@@ -97,25 +111,26 @@ if df is None:
     st.info("Use the sidebar to generate a synthetic portfolio first.")
     st.stop()
 
-# Tabs implement the walk-forward workflow
-tabs = st.tabs([
-    "1) Meter history",
-    "2) Profiling & disaggregation",
-    "3) Forecasting",
-    "4) Forwards hedging",
-    "5) Day-ahead (DA)",
-    "6) Intraday (ID) game loop",
-    "7) Settlement & learning",
-])
+tabs = st.tabs(
+    [
+        "1) Meter history",
+        "2) Profiling & disaggregation",
+        "3) Forecasting",
+        "4) Forwards hedging",
+        "5) Day-ahead (DA)",
+        "6) Intraday (ID) game loop",
+        "7) Settlement & learning",
+    ]
+)
 
 tz = cfg.tz
 df = df.copy()
 if df.index.tz is None:
     df.index = df.index.tz_localize(tz)
 
-# Helper: select day
 available_days = pd.Index(pd.to_datetime(pd.Series(df.index.date).unique())).sort_values()
 default_day = available_days[-2] if len(available_days) >= 2 else available_days[-1]
+
 
 def get_day_slice(day_ts: pd.Timestamp) -> pd.DataFrame:
     day_ts = day_ts.tz_localize(tz) if day_ts.tzinfo is None else day_ts.tz_convert(tz)
@@ -123,18 +138,20 @@ def get_day_slice(day_ts: pd.Timestamp) -> pd.DataFrame:
     end = start + pd.Timedelta(days=1)
     return df.loc[(df.index >= start) & (df.index < end)]
 
+
 with tabs[0]:
     st.subheader("1) Meter history (portfolio net meter)")
     col1, col2 = st.columns([2, 1])
     with col2:
-        chosen_day = st.selectbox("Choose a day to simulate forward from", available_days, index=len(available_days)-2)
+        chosen_day = st.selectbox(
+            "Choose a day to simulate forward from", available_days, index=len(available_days) - 2
+        )
         st.session_state.selected_day = pd.Timestamp(chosen_day).tz_localize(tz)
 
-    # Show last 7 days net load
     last7 = df.tail(7 * 24 * 4)
     st.plotly_chart(
         portfolio_components(last7, title="Last 7 days: components and net meter (kW)"),
-        use_container_width=True
+        use_container_width=True,
     )
 
     net = pd.Series(df["net_kw"].values, index=df.index)
@@ -143,21 +160,28 @@ with tabs[0]:
     fig = line_with_band(
         prof.reset_index().assign(time=prof.index / 4.0),
         x=prof.index,
-        y="p50", low="p10", high="p90",
-        title="Typical day (96 points) — net meter kW percentiles"
+        y="p50",
+        low="p10",
+        high="p90",
+        title="Typical day (96 points) — net meter kW percentiles",
     )
     st.plotly_chart(fig, use_container_width=True)
+
 
 with tabs[1]:
     st.subheader("2) Profiling & disaggregation (intuitive portfolio decomposition)")
     day_df = get_day_slice(st.session_state.selected_day)
-    st.plotly_chart(portfolio_components(day_df, title=f"Selected day components (kW): {st.session_state.selected_day.date()}"), use_container_width=True)
+    st.plotly_chart(
+        portfolio_components(day_df, title=f"Selected day components (kW): {st.session_state.selected_day.date()}"),
+        use_container_width=True,
+    )
 
     st.markdown("**Interpretation:**")
     st.write("- Household drives morning/evening shape.")
     st.write("- PV reduces net demand midday (can create export-like behavior if large).")
     st.write("- EV adds evening/night blocks (portfolio-level smoothing).")
     st.write("- Battery shifts within-day energy (very simplified heuristic in MVP).")
+
 
 with tabs[2]:
     st.subheader("3) Forecasting (LT summary + DA 96-point + ID nowcast)")
@@ -170,29 +194,63 @@ with tabs[2]:
         noise = st.slider("Forecast noise", 0.0, 0.10, 0.03, step=0.01)
 
     target_day = st.session_state.selected_day + pd.Timedelta(days=1)
-    da_f = day_ahead_forecast(df, tz=tz, target_date=target_day, pv_forecast_bias=pv_bias, ev_timing_shift_qh=ev_shift, noise_scale=noise)
+    da_f = day_ahead_forecast(
+        df, tz=tz, target_date=target_day, pv_forecast_bias=pv_bias, ev_timing_shift_qh=ev_shift, noise_scale=noise
+    )
     st.session_state.da_forecast = da_f
 
-    # show forecast band
     st.plotly_chart(line_with_band(da_f, title=f"DA forecast for {target_day.date()} (96×15-min)"), use_container_width=True)
 
-    # create "actual" for that day from synthetic history if available (for replay)
     actual_day = get_day_slice(target_day)
     if len(actual_day) == 96:
         st.session_state.actual_day_kw = pd.Series(actual_day["net_kw"].values, index=actual_day.index)
 
+
 with tabs[3]:
-    st.subheader("4) Forwards hedging (intuition-first)")
+    st.subheader("4) Forwards hedging (E.ON-style layered + seasonal)")
     if st.session_state.da_forecast is None:
         st.warning("Go to Forecasting tab first to generate the DA forecast.")
         st.stop()
 
-    hedge_ratio = st.slider("Hedge ratio (energy volume)", 0.0, 1.0, 0.85, step=0.05)
     da_curve = st.session_state.da_forecast["forecast_kw"]
 
-    # Simple forward hedge: constant hedge as % of daily average (energy-only)
-    avg_kw = float(da_curve.mean())
-    forward_kw = pd.Series(avg_kw * hedge_ratio, index=da_curve.index)
+    hedge_ratio = st.slider("Total hedge ratio (energy volume)", 0.0, 1.0, 0.85, step=0.05)
+
+    st.markdown("### Desk-style hedge shaping")
+    base_share = st.slider("Baseload share (before season/day adjustment)", 0.40, 0.95, 0.70, step=0.05)
+    peak_share = 1.0 - float(base_share)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        forecast_conf = st.slider("Forecast confidence", 0.0, 1.0, 0.70, step=0.05)
+    with c2:
+        ev_flex = st.slider("EV flexibility available", 0.0, 1.0, 0.60, step=0.05)
+    with c3:
+        pv_unc = st.slider("PV uncertainty", 0.0, 1.0, 0.50, step=0.05)
+
+    peak_strength = st.slider("Peak shaping strength", 0.0, 1.0, 1.00, step=0.05)
+
+    st.markdown("### Season & weekend logic")
+    e1, e2 = st.columns(2)
+    with e1:
+        enable_seasonality = st.toggle("Enable seasonality (winter more peak)", value=True)
+    with e2:
+        enable_weekend = st.toggle("Enable weekend logic (later/weaker peak)", value=True)
+
+    forward_kw = build_layered_hedge_curve_eon_style_seasonal(
+        idx=da_curve.index,
+        da_forecast_kw=da_curve,
+        hedge_ratio_total=float(hedge_ratio),
+        base_share_of_hedge=float(base_share),
+        peak_share_of_hedge=float(peak_share),
+        peak_shape_strength=float(peak_strength),
+        forecast_confidence=float(forecast_conf),
+        ev_flex_available=float(ev_flex),
+        pv_uncertainty=float(pv_unc),
+        enable_seasonality=bool(enable_seasonality),
+        enable_weekend_logic=bool(enable_weekend),
+        freq_min=cfg.freq_min,
+    )
 
     st.session_state.forward_kw = forward_kw
 
@@ -204,9 +262,10 @@ with tabs[3]:
         idx=da_curve.index,
         contracted=forward_kw.values,
         actual=da_curve.values,
-        title="Forward hedge (flat) vs DA forecast (kW)"
+        title="E.ON-style layered forward hedge vs DA forecast (kW)",
     )
     st.plotly_chart(fig, use_container_width=True)
+
 
 with tabs[4]:
     st.subheader("5) Day-ahead (DA) — shaping the schedule")
@@ -220,7 +279,6 @@ with tabs[4]:
     da_forecast_kw = st.session_state.da_forecast["forecast_kw"]
     forward_kw = st.session_state.forward_kw
 
-    # DA purchase: buy remaining portion with strategy bias; cannot go below 0
     da_needed = (da_forecast_kw - forward_kw).clip(lower=0.0) * (1.0 + extra)
     da_kw = da_needed.clip(lower=0.0)
 
@@ -234,15 +292,20 @@ with tabs[4]:
 
     st.plotly_chart(
         compare_positions(da_forecast_kw.index, contracted.values, da_forecast_kw.values, title="DA contracted vs forecast (kW)"),
-        use_container_width=True
+        use_container_width=True,
     )
 
-    # Prices for the day
-    mult = regime_mult(st.session_state.get("price_regime", "Normal"), cfg)  # optional
-    prices = make_price_curves(da_forecast_kw.index, cfg.base_da_price, cfg.base_id_price, cfg.base_imb_price,
-                              regime_mult=regime_mult(price_regime, cfg), seed=42)
+    prices = make_price_curves(
+        da_forecast_kw.index,
+        cfg.base_da_price,
+        cfg.base_id_price,
+        cfg.base_imb_price,
+        regime_mult=regime_mult(st.session_state.price_regime, cfg),
+        seed=42,
+    )
     st.session_state.prices = prices
     st.plotly_chart(price_chart(prices, title="DA / ID / Imbalance price curves (synthetic)"), use_container_width=True)
+
 
 with tabs[5]:
     st.subheader("6) Intraday (ID) — playable game loop (trade vs flexibility)")
@@ -257,19 +320,16 @@ with tabs[5]:
 
     idx = da_forecast.index
 
-    # Use actual day if exists; otherwise create a plausible "actual" from forecast with noise
     if st.session_state.actual_day_kw is not None and len(st.session_state.actual_day_kw) == 96:
         actual = st.session_state.actual_day_kw.reindex(idx).fillna(da_forecast["forecast_kw"])
     else:
         rng = np.random.default_rng(1234)
         actual = pd.Series(np.clip(da_forecast["forecast_kw"].values * (1.0 + rng.normal(0, 0.05, size=96)), 0, None), index=idx)
 
-    # init intraday state
     if st.session_state.id_state is None or st.session_state.id_state.idx[0] != idx[0]:
         st.session_state.id_state = IntradayState(idx=idx)
     id_state: IntradayState = st.session_state.id_state
 
-    # choose current simulation time
     colL, colR = st.columns([1, 2])
     with colL:
         now_i = st.slider("Simulation time (15-min step)", 0, 95, 32, step=1)
@@ -282,7 +342,6 @@ with tabs[5]:
         flex_strength = st.slider("Flex dispatch strength (0..1)", 0.0, 1.0, 0.4, step=0.05)
 
         if st.button("Apply step decisions"):
-            # build nowcast using actual so far
             actual_so_far = actual.iloc[: now_i + 1]
             nowcast_df = intraday_nowcast(da_forecast, actual_so_far=actual_so_far, now=now, tz=tz)
 
@@ -294,34 +353,34 @@ with tabs[5]:
                 do_trade_kwh=float(trade_kwh),
                 trade_delivery_hours=int(delivery_h),
                 flex_strength=float(flex_strength),
-                freq_min=cfg.freq_min
+                freq_min=cfg.freq_min,
             )
             st.success("Applied trade + flex for the selected step.")
 
-    # Build nowcast and show current delta
     actual_so_far = actual.iloc[: now_i + 1]
     nowcast_df = intraday_nowcast(da_forecast, actual_so_far=actual_so_far, now=now, tz=tz)
 
     contracted = (forward_kw + da_kw + id_state.trades_kw).reindex(idx)
     actual_after_flex = (actual + id_state.flex_shift_kw).clip(lower=0.0)
 
-    # Flex envelope (simple visualization): +/- max shift based on flex_strength cap
-    max_shift = 600.0  # kW for portfolio
+    max_shift = 600.0
     low_env = (nowcast_df["nowcast_kw"] - max_shift).clip(lower=0.0)
     high_env = nowcast_df["nowcast_kw"] + max_shift
 
     with colR:
         st.plotly_chart(
-            compare_positions(idx, contracted.values, actual_after_flex.values,
-                              title="Contracted vs Actual (after flex) — intraday view",
-                              flex_envelope=(low_env.values, high_env.values)),
-            use_container_width=True
+            compare_positions(
+                idx, contracted.values, actual_after_flex.values,
+                title="Contracted vs Actual (after flex) — intraday view",
+                flex_envelope=(low_env.values, high_env.values),
+            ),
+            use_container_width=True,
         )
 
-        # Show delta summary
         delta_kw = actual_after_flex - contracted
         st.write(f"Current (interval) delta at {now.strftime('%H:%M')}: **{delta_kw.loc[now]:.1f} kW**")
         st.write(f"Cumulative imbalance energy (kWh) so far: **{(delta_kw.iloc[:now_i+1].sum() * 0.25):.1f}**")
+
 
 with tabs[6]:
     st.subheader("7) Settlement & learning")
@@ -337,7 +396,6 @@ with tabs[6]:
     da_kw = st.session_state.da_kw.reindex(idx).fillna(0.0)
     id_state: IntradayState = st.session_state.id_state
 
-    # Reconstruct "actual" same as in intraday tab (for consistency)
     day_df = get_day_slice(idx[0])
     if len(day_df) == 96:
         actual = pd.Series(day_df["net_kw"].values, index=idx)
@@ -352,10 +410,9 @@ with tabs[6]:
         id_trades_kw=id_state.trades_kw.reindex(idx).fillna(0.0),
         flex_shift_kw=id_state.flex_shift_kw.reindex(idx).fillna(0.0),
         prices=prices,
-        freq_min=cfg.freq_min
+        freq_min=cfg.freq_min,
     )
 
-    # Baseline (no intraday, no flex) for comparison
     baseline = compute_settlement(
         actual_net_kw=actual,
         forward_kw=forward_kw,
@@ -363,7 +420,7 @@ with tabs[6]:
         id_trades_kw=pd.Series(0.0, index=idx),
         flex_shift_kw=pd.Series(0.0, index=idx),
         prices=prices,
-        freq_min=cfg.freq_min
+        freq_min=cfg.freq_min,
     )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -372,17 +429,20 @@ with tabs[6]:
     c3.metric("ID cost (€)", f"{result['id_cost_eur']:.0f}")
     c4.metric("Imbalance cost (€)", f"{result['imb_cost_eur']:.0f}")
 
-    st.metric("Total cost (€)", f"{result['total_cost_eur']:.0f}",
-              delta=f"{(baseline['total_cost_eur'] - result['total_cost_eur']):.0f} vs no-ID/no-flex")
+    st.metric(
+        "Total cost (€)",
+        f"{result['total_cost_eur']:.0f}",
+        delta=f"{(baseline['total_cost_eur'] - result['total_cost_eur']):.0f} vs no-ID/no-flex",
+    )
 
     st.plotly_chart(
         compare_positions(
             idx=idx,
             contracted=result["contracted_kw"].values,
             actual=result["actual_after_flex_kw"].values,
-            title="Final contracted vs actual after flex (kW)"
+            title="Final contracted vs actual after flex (kW)",
         ),
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.plotly_chart(
@@ -390,11 +450,11 @@ with tabs[6]:
             idx=idx,
             contracted=pd.Series(0.0, index=idx).values,
             actual=result["imbalance_kw"].values,
-            title="Imbalance profile (kW)"
+            title="Imbalance profile (kW)",
         ),
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.markdown("### Learning (MVP)")
-    st.write("- Use the **Compare runs** idea by changing hedging ratio, DA strategy, and intraday actions.")
-    st.write("- In a V2, you’d update behavioral/forecast parameters based on today’s forecast errors and EV plug-in patterns.")
+    st.write("- Change hedge ratio, base share, season/weekend toggles, DA strategy, and intraday actions.")
+    st.write("- Compare total cost vs the no-ID/no-flex baseline to see flexibility value.")
