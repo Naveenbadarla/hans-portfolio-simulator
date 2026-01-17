@@ -4,7 +4,7 @@ import pandas as pd
 
 from sim.config import SimConfig
 from sim.portfolio import build_portfolio
-from sim.forecasting import day_ahead_forecast, intraday_nowcast, typical_day_profile
+from sim.forecasting import day_ahead_forecast, typical_day_profile
 from sim.markets import make_price_curves, build_layered_hedge_curve_eon_style_seasonal
 from sim.intraday import IntradayState, build_ev_plan_from_shift, enforce_ev_deadline, step_intraday
 from sim.settlement import compute_settlement
@@ -53,6 +53,11 @@ def init_state():
         "weather_regime",
         "price_regime",
         "ev_cap_kw",
+        # EV feasibility objects for delivery day
+        "base_ev_kw_day",
+        "ev_cap_series_kw_day",
+        "ev_required_kwh_deadline",
+        "ev_deadline_ts",
     ]:
         if k not in st.session_state:
             st.session_state[k] = None
@@ -64,6 +69,7 @@ def init_state():
 
 init_state()
 cfg: SimConfig = st.session_state.cfg
+tz = cfg.tz
 
 st.title("Hans Portfolio Walk-Forward Simulator (Germany, 15-min, 1,000 customers)")
 
@@ -91,7 +97,7 @@ with st.sidebar:
         cfg_dict = cfg.__dict__.copy()
         st.session_state.portfolio_df = cached_portfolio(cfg_dict, str(end_date), st.session_state.weather_regime, int(seed))
 
-        # reset
+        # reset run state
         st.session_state.selected_day = None
         st.session_state.forward_kw = None
         st.session_state.da_kw = None
@@ -99,6 +105,12 @@ with st.sidebar:
         st.session_state.prices = None
         st.session_state.id_state = None
         st.session_state.actual_day_kw = None
+
+        # reset EV feasibility objects
+        st.session_state.base_ev_kw_day = None
+        st.session_state.ev_cap_series_kw_day = None
+        st.session_state.ev_required_kwh_deadline = None
+        st.session_state.ev_deadline_ts = None
 
         # Derive a global EV cap from history (kW)
         df_tmp = st.session_state.portfolio_df
@@ -111,19 +123,6 @@ if df is None:
     st.info("Use the sidebar to generate a synthetic portfolio first.")
     st.stop()
 
-tabs = st.tabs(
-    [
-        "1) Meter history",
-        "2) Profiling & disaggregation",
-        "3) Forecasting",
-        "4) Forwards hedging",
-        "5) Day-ahead (DA)",
-        "6) Intraday (ID) game loop",
-        "7) Settlement & learning",
-    ]
-)
-
-tz = cfg.tz
 df = df.copy()
 if df.index.tz is None:
     df.index = df.index.tz_localize(tz)
@@ -140,35 +139,41 @@ def get_day_slice(day_ts: pd.Timestamp) -> pd.DataFrame:
 
 def build_ev_baseline_and_capacity(idx_day: pd.DatetimeIndex) -> tuple[pd.Series, pd.Series]:
     """
-    Build a baseline EV profile (kW) for the day from historical typical-day p50,
-    and a connected-capacity series (kW) representing how much EV charging is physically possible.
+    Baseline EV profile from historical typical-day p50.
+    Connected capacity series: time-varying cap, bounded by global cap.
     """
     ev_hist = pd.Series(df["ev_kw"].values, index=df.index)
     ev_typ = typical_day_profile(ev_hist, tz=tz)["p50"].values
     base_ev = pd.Series(ev_typ, index=idx_day).clip(lower=0.0)
 
-    # Connected capacity: baseline + headroom factor, capped by global EV cap.
-    # This mimics "how many EVs are plugged in" without per-customer modeling.
     global_cap = float(st.session_state.ev_cap_kw or 600.0)
 
-    # Allow more capacity when baseline EV is higher; less when baseline is near zero.
+    # Time-varying connected capacity proxy:
     cap = (base_ev * 1.8 + global_cap * 0.15).clip(lower=0.0)
     cap = cap.clip(upper=global_cap)
     return base_ev, cap
 
 
 def required_kwh_by_deadline_from_baseline(base_ev_kw: pd.Series, deadline_ts: pd.Timestamp, freq_min: int = 15) -> float:
-    """
-    Define the required EV energy by deadline as the baseline energy up to deadline.
-    This is an MVP way to create a hard constraint consistent with the synthetic behavior.
-    """
     deadline_ts = deadline_ts if deadline_ts.tzinfo else deadline_ts.tz_localize(base_ev_kw.index.tz)
     pre = base_ev_kw.index <= deadline_ts
     return float(base_ev_kw.loc[pre].sum() * (freq_min / 60.0))
 
 
+tabs = st.tabs(
+    [
+        "1) Meter history",
+        "2) Profiling & disaggregation",
+        "3) Forecasting",
+        "4) Forwards hedging",
+        "5) Day-ahead (DA)",
+        "6) Intraday (ID) game loop",
+        "7) Settlement & learning",
+    ]
+)
+
 with tabs[0]:
-    st.subheader("1) Meter history (portfolio net meter)")
+    st.subheader("1) Meter history")
     c1, c2 = st.columns([2, 1])
     with c2:
         chosen_day = st.selectbox("Choose a day to simulate forward from", available_days, index=len(available_days) - 2)
@@ -194,9 +199,15 @@ with tabs[2]:
     noise = st.slider("Forecast noise", 0.0, 0.10, 0.03, step=0.01)
 
     target_day = st.session_state.selected_day + pd.Timedelta(days=1)
-    da_f = day_ahead_forecast(df, tz=tz, target_date=target_day, pv_forecast_bias=pv_bias, ev_timing_shift_qh=ev_shift, noise_scale=noise)
+    da_f = day_ahead_forecast(
+        df,
+        tz=tz,
+        target_date=target_day,
+        pv_forecast_bias=pv_bias,
+        ev_timing_shift_qh=ev_shift,
+        noise_scale=noise
+    )
     st.session_state.da_forecast = da_f
-
     st.plotly_chart(line_with_band(da_f, title=f"DA forecast for {target_day.date()} (96×15-min)"), use_container_width=True)
 
     actual_day = get_day_slice(target_day)
@@ -238,16 +249,13 @@ with tabs[3]:
         enable_weekend_logic=bool(enable_weekend),
         freq_min=cfg.freq_min,
     )
-    st.session_state.forward_kw = forward_kw
 
-    st.plotly_chart(
-        compare_positions(da_curve.index, forward_kw.values, da_curve.values, title="Forward hedge vs DA forecast (kW)"),
-        use_container_width=True
-    )
+    st.session_state.forward_kw = forward_kw
+    st.plotly_chart(compare_positions(da_curve.index, forward_kw.values, da_curve.values, title="Forward hedge vs DA forecast (kW)"), use_container_width=True)
 
 
 with tabs[4]:
-    st.subheader("5) Day-ahead (DA): buy/sell delta + EV shifting with energy-by-departure deadline")
+    st.subheader("5) Day-ahead (DA): buy/sell delta + EV scheduling with energy-by-departure deadline")
     if st.session_state.forward_kw is None or st.session_state.da_forecast is None:
         st.warning("Run Forecasting + Hedging first.")
         st.stop()
@@ -256,7 +264,6 @@ with tabs[4]:
     idx_day = da_forecast_kw.index
     forward_kw = st.session_state.forward_kw
 
-    # Prices
     prices = make_price_curves(
         idx_day,
         cfg.base_da_price,
@@ -268,19 +275,21 @@ with tabs[4]:
     st.session_state.prices = prices
     st.plotly_chart(price_chart(prices, title="DA / ID / Imbalance price curves (synthetic)"), use_container_width=True)
 
-    # Build EV baseline + connected capacity series
     base_ev_kw, ev_cap_series_kw = build_ev_baseline_and_capacity(idx_day)
 
-    # Deadline setup
     deadline_hour = st.selectbox("EV departure deadline (hour)", [6.0, 7.0, 8.0], index=1)
+
+    # ---- FIXED TIMEZONE HANDLING ----
     deadline_ts = idx_day[0].normalize() + pd.Timedelta(hours=float(deadline_hour))
-    deadline_ts = deadline_ts.tz_localize(tz)
+    if deadline_ts.tzinfo is None:
+        deadline_ts = deadline_ts.tz_localize(tz)
+    else:
+        deadline_ts = deadline_ts.tz_convert(tz)
+    # --------------------------------
 
     required_kwh = required_kwh_by_deadline_from_baseline(base_ev_kw, deadline_ts, freq_min=cfg.freq_min)
-
     st.info(f"EV deadline: {deadline_ts.strftime('%H:%M')} | Required energy by deadline (kWh): ~{required_kwh:.1f}")
 
-    # DA shifting controls
     use_da_shift = st.toggle("Shift EV charging away from expensive evening hours in DA", value=True)
     flex_strength_da = st.slider("DA EV shift strength (0..1)", 0.0, 1.0, 0.5, step=0.05)
 
@@ -307,31 +316,21 @@ with tabs[4]:
     else:
         ev_plan_da = pd.Series(np.minimum(base_ev_kw.values, ev_cap_series_kw.values), index=idx_day)
 
-    # Net-load adjustment from EV plan
     ev_shift_adj = (ev_plan_da - base_ev_kw).fillna(0.0)
-
-    # DA bidding forecast after feasible EV plan
     da_forecast_for_bidding = (da_forecast_kw + ev_shift_adj).clip(lower=0.0)
 
     st.plotly_chart(
-        compare_positions(
-            idx_day,
-            da_forecast_for_bidding.values,
-            da_forecast_kw.values,
-            title="DA forecast after feasible EV scheduling (kW)"
-        ),
+        compare_positions(idx_day, da_forecast_for_bidding.values, da_forecast_kw.values, title="DA forecast after feasible EV scheduling (kW)"),
         use_container_width=True
     )
 
-    # DA buy/sell delta
     da_strategy = st.selectbox("DA strategy", ["Follow forecast", "Conservative (buy extra)", "Leave for intraday"], index=0)
     buy_mult = {"Follow forecast": 1.0, "Conservative (buy extra)": 1.05, "Leave for intraday": 0.92}[da_strategy]
 
     raw_delta = da_forecast_for_bidding - forward_kw
     da_order = raw_delta.copy()
     da_order[da_order > 0] = da_order[da_order > 0] * buy_mult
-
-    da_kw = da_order  # allow negative (sell)
+    da_kw = da_order  # allow negative sell
     st.session_state.da_kw = da_kw
 
     contracted = forward_kw + da_kw
@@ -340,11 +339,11 @@ with tabs[4]:
         use_container_width=True
     )
 
-    # Store daily EV feasibility objects for ID tab (in session_state)
-    st.session_state["base_ev_kw_day"] = base_ev_kw
-    st.session_state["ev_cap_series_kw_day"] = ev_cap_series_kw
-    st.session_state["ev_required_kwh_deadline"] = required_kwh
-    st.session_state["ev_deadline_ts"] = deadline_ts
+    # store EV feasibility objects for ID tab
+    st.session_state.base_ev_kw_day = base_ev_kw
+    st.session_state.ev_cap_series_kw_day = ev_cap_series_kw
+    st.session_state.ev_required_kwh_deadline = required_kwh
+    st.session_state.ev_deadline_ts = deadline_ts
 
 
 with tabs[5]:
@@ -360,20 +359,17 @@ with tabs[5]:
     forward_kw = st.session_state.forward_kw.reindex(idx).fillna(0.0)
     da_kw = st.session_state.da_kw.reindex(idx).fillna(0.0)
 
-    # Actual
     if st.session_state.actual_day_kw is not None and len(st.session_state.actual_day_kw) == 96:
         actual = st.session_state.actual_day_kw.reindex(idx).fillna(da_forecast["forecast_kw"])
     else:
         rng = np.random.default_rng(1234)
         actual = pd.Series(np.clip(da_forecast["forecast_kw"].values * (1.0 + rng.normal(0, 0.05, size=96)), 0, None), index=idx)
 
-    # EV feasibility objects from DA tab
-    base_ev_kw = st.session_state.get("base_ev_kw_day", pd.Series(0.0, index=idx))
-    ev_cap_series_kw = st.session_state.get("ev_cap_series_kw_day", pd.Series(0.0, index=idx))
-    required_kwh = float(st.session_state.get("ev_required_kwh_deadline", 0.0))
-    deadline_ts = st.session_state.get("ev_deadline_ts", idx[0].normalize().tz_localize(tz) + pd.Timedelta(hours=7))
+    base_ev_kw = st.session_state.base_ev_kw_day if st.session_state.base_ev_kw_day is not None else pd.Series(0.0, index=idx)
+    ev_cap_series_kw = st.session_state.ev_cap_series_kw_day if st.session_state.ev_cap_series_kw_day is not None else pd.Series(0.0, index=idx)
+    required_kwh = float(st.session_state.ev_required_kwh_deadline or 0.0)
+    deadline_ts = st.session_state.ev_deadline_ts if st.session_state.ev_deadline_ts is not None else (idx[0].normalize() + pd.Timedelta(hours=7))
 
-    # state
     if st.session_state.id_state is None or st.session_state.id_state.idx[0] != idx[0]:
         st.session_state.id_state = IntradayState(idx=idx)
     id_state: IntradayState = st.session_state.id_state
@@ -407,7 +403,6 @@ with tabs[5]:
             )
             st.success("Applied intraday trade + EV scheduling (deadline enforced).")
 
-        # Show deadline status
         pre = idx <= deadline_ts
         delivered_kwh = float(id_state.ev_plan_kw.loc[pre].sum() * (cfg.freq_min / 60.0)) if id_state.ev_plan_kw is not None else 0.0
         st.write(f"EV delivered by deadline (kWh): **{delivered_kwh:.1f} / {required_kwh:.1f}**")
@@ -416,10 +411,7 @@ with tabs[5]:
     actual_after_ev = (actual + id_state.flex_shift_kw).clip(lower=0.0)
 
     with colR:
-        st.plotly_chart(
-            compare_positions(idx, contracted.values, actual_after_ev.values, title="Contracted vs Actual (after EV scheduling) — intraday view"),
-            use_container_width=True
-        )
+        st.plotly_chart(compare_positions(idx, contracted.values, actual_after_ev.values, title="Contracted vs Actual (after EV scheduling) — intraday view"), use_container_width=True)
 
 
 with tabs[6]:
@@ -479,5 +471,6 @@ with tabs[6]:
     )
 
     st.markdown("### What changed vs previous version")
-    st.write("- EV scheduling is now constrained by a **hard energy-by-departure deadline** (e.g., 07:00).")
-    st.write("- If you shift too much away from early hours, the planner will *force* charging back in before the deadline (at the cheapest feasible slots).")
+    st.write("- EV scheduling is constrained by a **hard energy-by-departure deadline** (e.g., 07:00).")
+    st.write("- DA can **buy or sell** (negative DA = sell).")
+    st.write("- Tight deadlines reduce how much you can shift out of peak.")
